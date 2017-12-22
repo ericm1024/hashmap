@@ -2,6 +2,8 @@
 #include <iostream>
 #include <unordered_set>
 
+using namespace std;
+
 void test_really_basic()
 {
         cout << __func__ << endl;

@@ -10,16 +10,43 @@
 #include <stdlib.h>
 #include <iostream>
 
-using namespace std;
+// xxx: not sure which one I need
+#include "emmintrin.h"
+#include "immintrin.h"
+
+// TODO:
+// * use 1 bit for sentinal|value, use 7 bits for hash
+//     bit7 --> sentinal
+//     if bit7 == 1:
+//         bits 6:0 dictate empty or erased
+//     if bit7 == 0:
+//         bits 6:0 are low 7 bits of hash
+//
+// * add an extra byte hanging off the end of the metadata table that dictates "end of table"
+//   so iterators don't have to hold so much crap. They should just be able to store pointer + offset,
+//   maybe even just a pointer with a shift stuffed in the upper bits.
+//
+// * use top bits of hash as index into table, use bottom 7 bits to compare with metadata
+//   via functions H1 and H2
+//
+// * implement lookup with _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_set1_epi8(hash_byte), meta_bytes))
+//   that give you back a 16-bit bitmap which you can then scan with __builtin_ffs or whatever
+//
+// * don't store the upper bits of the hash
+//
+// * seed the 57 bits of the hash with aslr >> 12
+//
+// * max load factor == 7/8
+//
+// * robin hood hashing == bad bc too many instructions
+//
+// * use only a single memory allocation
+//
+// * use C++ allocators
 
 template<typename T>
 struct hash_set_mem
 {
-        struct value {
-                size_t hash;
-                T val;
-        };
-
         size_t capacity_;
         
         // lower 2 bits
@@ -27,13 +54,13 @@ struct hash_set_mem
         //  x1 --> occupied
         //  1x --> ever occupied
         uint8_t * meta_vec_;
-        value * data_vec_;
+        T * data_vec_;
 
         // XXX: don't malloc
         hash_set_mem(size_t cap)
                 : capacity_{cap},
                   meta_vec_{(uint8_t *)malloc(capacity_)},
-                  data_vec_{(value *)malloc(capacity_ * sizeof(value))}
+                  data_vec_{(T *)malloc(capacity_ * sizeof(T))}
         {
                 memset(meta_vec_, 0, capacity_);
                 assert(meta_vec_);
@@ -44,7 +71,7 @@ struct hash_set_mem
         {
                 for (size_t i = 0; i < capacity_; ++i)
                         if (meta_vec_[i] & 0x1)
-                                data_vec_[i].val.~T();
+                                data_vec_[i].~T();
                 free(meta_vec_);
                 free(data_vec_);
         }
@@ -74,7 +101,6 @@ class hash_set : hash_set_mem<T>
 {
 public:
         using base_t = hash_set_mem<T>;
-        using value = typename base_t::value;
 
         size_t size_;
         size_t tombstones_;
@@ -113,11 +139,8 @@ public:
         // xxx: make this iterator smaller? currently 32 bytes...
         template <bool is_const> 
         class iterator_impl {
-
-        public:
                 using meta_ptr_t = typename std::conditional<is_const, const uint8_t *, uint8_t *>::type;
-                using data_ptr_t = typename std::conditional<is_const, const value *, value *>::type;
-
+        public:
                 using iterator_category = std::bidirectional_iterator_tag;
                 using value_type = typename std::conditional<is_const, const T, T>::type;
                 using difference_type = std::ptrdiff_t;
@@ -175,7 +198,7 @@ public:
                 
                 reference operator*()
                 {
-                        return data_start[offset].val;
+                        return data_start[offset];
                 }
 
         private:
@@ -185,19 +208,14 @@ public:
                 // we assign from one container's iterator to another...
                 size_t capacity = 0;
                 meta_ptr_t meta_start = nullptr;
-                data_ptr_t data_start = nullptr;
+                pointer data_start = nullptr;
                 
                 size_t offset = 0;
 
-                iterator_impl(size_t cap, meta_ptr_t meta, data_ptr_t data, size_t off)
+                iterator_impl(size_t cap, meta_ptr_t meta, pointer data, size_t off)
                         : capacity{cap}, meta_start{meta}, data_start{data}, offset{off}
                 {}
         };
-
-        iterator end()
-        {
-                return iterator{this->capacity_, this->meta_vec_, this->data_vec_, this->capacity_};
-        }
 
 private:
         size_t __find_first_occupied() const
@@ -214,21 +232,34 @@ private:
                 assert(!"corrupted table");
         }
 
-public: 
+        iterator iterator_at(size_t i)
+        {
+                return iterator{this->capacity_, this->meta_vec_, this->data_vec_, i};
+        }
+
+        const_iterator iterator_at(size_t i) const
+        {
+                return const_iterator{this->capacity_, this->meta_vec_, this->data_vec_, i};
+        }
+
+public:
+        iterator end()
+        {
+                return iterator_at(this->capacity_);
+        }
+        
         iterator begin()
         {
-                if (size_ == 0) {
+                if (size() == 0) {
                         return end();
                 }
 
-                return iterator{this->capacity_, this->meta_vec_, this->data_vec_,
-                                __find_first_occupied()};
+                return iterator_at(__find_first_occupied());
         }
 
         const_iterator end() const
         {
-                return const_iterator{this->capacity_, this->meta_vec_, this->data_vec_,
-                                this->capacity_};
+                return iterator_at(this->capacity_);
         }
 
         // xxx: can we avoid this duplication ? 
@@ -238,8 +269,7 @@ public:
                         return end();
                 }
                 
-                return const_iterator{this->capacity_, this->meta_vec_, this->data_vec_,
-                                __find_first_occupied()};
+                return iterator_at(__find_first_occupied());
         }
         
         size_t __find(const T& val, bool & found) const
@@ -261,8 +291,8 @@ public:
                         // is this slot currently occupied and do the lower bits of the hash and
                         // tht occupied bits. 0xfd == b11111101
                         if ((meta & 0xfd) == (((hash & 0x3f) << 2) | 1)) {
-                                value & v= this->data_vec_[i];
-                                if (v.hash == hash && val == v.val) {
+                                T & v= this->data_vec_[i];
+                                if (val == v) {
                                         found = true;
                                         break;
                                 }
@@ -281,13 +311,12 @@ public:
                 bool found;
                 size_t idx = __find(val, found);
 
-                return found ? iterator{this->capacity_, this->meta_vec_, this->data_vec_, idx}
-                             : end();
+                return found ? iterator_at(idx) : end();
         }
 
         const_iterator find(const T& val) const
         {
-                return find(val);
+                return find(val); // XXX: const violation, right?
         }
 
         void erase(const T& val)
@@ -299,7 +328,7 @@ public:
                         assert(size_ > 0);
                         
                         this->meta_vec_[idx] = 0x2;
-                        this->data_vec_[idx].val.~T();
+                        this->data_vec_[idx].~T();
                         --size_;
 
                         // don't shrink because we don't want to invalidate iterators. gross.
@@ -313,7 +342,7 @@ private:
         {
                 iterator where = find(val);
                 if (where != end()) {
-                        return make_pair(where, false);
+                        return std::make_pair(where, false);
                 }
 
                 if (load() > 0.7) {
@@ -322,7 +351,7 @@ private:
 
                         for (iterator i = begin(); i != end(); ++i) {
                                 // xxx: this insert() makes us recompute the hash, which isn't great
-                                bigger.insert(std::move(this->data_vec_[i.offset].val));
+                                bigger.insert(std::move(this->data_vec_[i.offset]));
                                 this->meta_vec_[i.offset] &= ~0x1;
                         }
 
@@ -344,11 +373,9 @@ private:
                                 if (!(meta & 0x2))
                                         ++tombstones_;
 
-                                this->data_vec_[i].hash = hash;
-                                new (&this->data_vec_[i].val) T{std::forward<U>(val)};
+                                new (&this->data_vec_[i]) T{std::forward<U>(val)};
                                 ++size_;
-                                return make_pair(iterator{this->capacity_, this->meta_vec_,
-                                                        this->data_vec_, i}, true);
+                                return std::make_pair(iterator_at(i), true);
                         }
 
                         i = (i + 1) % this->capacity_;
@@ -386,12 +413,13 @@ public:
                 return this->capacity_;
         }
 
+private:
+        // XXX: do better
         size_t do_hash(const T& val) const
         {
                 return std::hash<T>{}(val);
         }
-
-private:
+        
         double __size_load() const
         {
                 return size_/double(this->capacity_);
