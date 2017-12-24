@@ -16,19 +16,12 @@
 #include "immintrin.h"
 
 // TODO:
-// * use 1 bit for sentinal|value, use 7 bits for hash
-//
 // * add an extra byte hanging off the end of the metadata table that dictates "end of table"
 //   so iterators don't have to hold so much crap. They should just be able to store pointer + offset,
 //   maybe even just a pointer with a shift stuffed in the upper bits.
 //
-// * use top bits of hash as index into table, use bottom 7 bits to compare with metadata
-//   via functions H1 and H2
-//
 // * implement lookup with _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_set1_epi8(hash_byte), meta_bytes))
 //   that give you back a 16-bit bitmap which you can then scan with __builtin_ffs or whatever
-//
-// * don't store the upper bits of the hash
 //
 // * seed the 57 bits of the hash with aslr >> 12
 //
@@ -113,34 +106,79 @@ struct hash_set_mem
         //  x0 --> unoccupied
         //  x1 --> occupied
         //  1x --> ever occupied
-        meta * meta_vec_;
-        T * data_vec_;
+private:
+        void * mem_;
+
+        // XXX: these two functions depend on the child class only using capacities that are
+        // divisible by the alignment of T
+        ptrdiff_t data_offset() const
+        {
+                assert(capacity_ % alignof(T) == 0);
+
+                std::ptrdiff_t off = capacity_ * sizeof(meta);
+
+                // TODO: support weirdly alligned types? If alignof(T) > malloc alignment, we
+                // don't work at all.
+                assert((reinterpret_cast<std::ptrdiff_t>(mem_) + off) % alignof(T) == 0);
+
+                return off;
+        }
+
+        size_t alloc_size() const
+        {
+                assert(capacity_ % alignof(T) == 0);
+
+                return capacity_ * (sizeof(meta) + sizeof(T));
+        }
+
+public:
+        meta * get_meta()
+        {
+                return static_cast<meta *>(mem_);
+        }
+
+        T * get_data()
+        {
+                return reinterpret_cast<T*>(static_cast<uint8_t *>(mem_)
+                                            + data_offset());
+        }
+
+        const meta * get_meta() const
+        {
+                return static_cast<const meta *>(mem_);
+        }
+
+        const T * get_data() const
+        {
+                return reinterpret_cast<const T*>(static_cast<const uint8_t *>(mem_)
+                                                  + data_offset());
+        }
 
         // XXX: don't malloc
         hash_set_mem(size_t cap)
                 : capacity_{cap},
-                  meta_vec_{(meta *)malloc(capacity_)},
-                  data_vec_{(T *)malloc(capacity_ * sizeof(T))}
+                  mem_{malloc(alloc_size())}
         {
-                memset(meta_vec_, 0, capacity_);
-                assert(meta_vec_);
-                assert(data_vec_);
+                assert(mem_);
+                memset(get_meta(), 0, capacity_);
         }
 
         ~hash_set_mem()
         {
+                meta * mvec = get_meta();
+                T * dvec = get_data();
                 for (size_t i = 0; i < capacity_; ++i)
-                        if (meta_vec_[i].is_occupied())
-                                data_vec_[i].~T();
-                free(meta_vec_);
-                free(data_vec_);
+                        if (mvec[i].is_occupied())
+                                dvec[i].~T();
+
+                // XXX: exception safety if dtor throws
+                free(mem_);
         }
 
         void swap(hash_set_mem & other)
         {
                 std::swap(capacity_, other.capacity_);
-                std::swap(meta_vec_, other.meta_vec_);
-                std::swap(data_vec_, other.data_vec_);
+                std::swap(mem_, other.mem_);
         }
 
         hash_set_mem(const hash_set_mem& ) = delete;
@@ -283,9 +321,9 @@ private:
         size_t __find_first_occupied() const
         {
                 assert(size_ > 0);
-
+                const meta * mvec = this->get_meta();
                 for (size_t i = 0; i < this->capacity_; ++i) {
-                        if (this->meta_vec_[i].is_occupied()) {
+                        if (mvec[i].is_occupied()) {
                                 return i;
                         }
                 }
@@ -296,12 +334,12 @@ private:
 
         iterator iterator_at(size_t i)
         {
-                return iterator{this->capacity_, this->meta_vec_, this->data_vec_, i};
+                return iterator{this->capacity_, this->get_meta(), this->get_data(), i};
         }
 
         const_iterator iterator_at(size_t i) const
         {
-                return const_iterator{this->capacity_, this->meta_vec_, this->data_vec_, i};
+                return const_iterator{this->capacity_, this->get_meta(), this->get_data(), i};
         }
 
 public:
@@ -339,11 +377,12 @@ public:
                 const size_t hash = do_hash(val);
                 const size_t start = (hash >> 7) % this->capacity_;
                 size_t i = start;
+                const meta * mvec = this->get_meta();
 
                 found = false;
 
                 do {
-                        meta m = this->meta_vec_[i];
+                        const meta m = mvec[i];
                         
                         // linear probing: we found a never-occupied, so we done
                         if (m.is_never_occupied()) {
@@ -351,7 +390,7 @@ public:
                         }
 
                         if (m.is_occupied() && m.get_hash() == (hash & 0x7f)) {
-                                T & v= this->data_vec_[i];
+                                const T & v= this->get_data()[i];
                                 if (val == v) {
                                         found = true;
                                         break;
@@ -387,8 +426,8 @@ public:
                 if (found) {
                         assert(size_ > 0);
                         
-                        this->meta_vec_[idx].make_tombstoned();
-                        this->data_vec_[idx].~T();
+                        this->get_meta()[idx].make_tombstoned();
+                        this->get_data()[idx].~T();
                         --size_;
 
                         // don't shrink because we don't want to invalidate iterators. gross.
@@ -400,6 +439,8 @@ private:
         template <typename U>
         std::pair<iterator,bool> __insert(U&& val)
         {
+                // xxx: this find basically does all the scanning of the insert below,
+                // we could avoid that with a good helper...
                 iterator where = find(val);
                 if (where != end()) {
                         return std::make_pair(where, false);
@@ -409,9 +450,11 @@ private:
                         // xxx: revisit these constants. 
                         hash_set bigger{__size_load() > 0.4 ? this->capacity_ * 2 : this->capacity_};
 
+                        meta * mvec = this->get_meta();
+                        T * dvec = this->get_data();
                         for (iterator i = begin(); i != end(); ++i) {
-                                bigger.insert(std::move(this->data_vec_[i.offset]));
-                                this->meta_vec_[i.offset].make_tombstoned();
+                                bigger.insert(std::move(dvec[i.offset]));
+                                mvec[i.offset].make_tombstoned();
                         }
 
                         swap(bigger);
@@ -421,9 +464,10 @@ private:
                 const size_t start = (hash >> 7) % this->capacity_;
 
                 size_t i = start;
+                meta * mvec = this->get_meta();
                 
                 do {
-                        meta & m = this->meta_vec_[i];
+                        meta & m = mvec[i];
 
                         if (m.is_insertable()) {
 
@@ -435,8 +479,8 @@ private:
                                 if (m.is_never_occupied())
                                         ++tombstones_;
 
-                                this->meta_vec_[i].make_occupied(hash & 0x7f);
-                                new (&this->data_vec_[i]) T{std::forward<U>(val)};
+                                mvec[i].make_occupied(hash & 0x7f);
+                                new (this->get_data() + i) T{std::forward<U>(val)};
                                 ++size_;
                                 return std::make_pair(iterator_at(i), true);
                         }
@@ -503,9 +547,10 @@ public:
 
         friend std::ostream& operator<<(std::ostream& os, const hash_set& set)
         {
+                meta * mvec = set.get_meta();
                 for (size_t i = 0; i < set.capacity(); ++i) {
                         os << std::hex << std::setfill('0') << std::setw(2)
-                           << int(set.meta_vec_[i].m_);
+                           << int(mvec[i].m_);
 
                         if (i != set.capacity() - 1) {
                                 os << " ";
