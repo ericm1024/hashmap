@@ -9,6 +9,7 @@
 
 #include <stdlib.h>
 #include <iostream>
+#include <iomanip>
 
 // xxx: not sure which one I need
 #include "emmintrin.h"
@@ -16,11 +17,6 @@
 
 // TODO:
 // * use 1 bit for sentinal|value, use 7 bits for hash
-//     bit7 --> sentinal
-//     if bit7 == 1:
-//         bits 6:0 dictate empty or erased
-//     if bit7 == 0:
-//         bits 6:0 are low 7 bits of hash
 //
 // * add an extra byte hanging off the end of the metadata table that dictates "end of table"
 //   so iterators don't have to hold so much crap. They should just be able to store pointer + offset,
@@ -48,18 +44,82 @@ template<typename T>
 struct hash_set_mem
 {
         size_t capacity_;
+
+        // bit7 --> sentinal
+        // if bit7 == 0:
+        //     bits 6:0 dictate empty, erased, or end of table
+        //     0x00 == empty/never occupied
+        //     0x01 == erased/tombstoned
+        //     0x7f == end of table (not used yet)
+        // if bit7 == 1:
+        //     bits 6:0 are low 7 bits of hash
+        struct meta {
+                uint8_t m_;
+
+                bool is_sentinal() const
+                {
+                        return (m_ & 0x80) == 0x00;
+                }
+
+                bool is_occupied() const
+                {
+                        return (m_ & 0x80) == 0x80;
+                }
+
+                // is_insertable is logically equivalent to "is_never_occupied || is_tombstone",
+                // but this spells what we actually want to ask, and it's a few less instructions
+                // that the compiler might not have been able to find.
+                bool is_insertable() const
+                {
+                        return (m_ & 0x82) == 0x00;
+                }
+
+                bool is_tombstone() const
+                {
+                        return m_ == 0x01;
+                }
+
+                bool is_never_occupied() const
+                {
+                        return m_ == 0x00;
+                }
+
+                bool is_end() const
+                {
+                        return m_ == 0x7f;
+                }
+
+                uint8_t get_hash() const
+                {
+                        assert(is_occupied());
+                        return m_ & 0x7f;
+                }
+
+                void make_tombstoned()
+                {
+                        m_ = 0x01;
+                }
+
+                void make_occupied(uint8_t hash)
+                {
+                        assert((hash & 0x80) == 0);
+                        m_ = 0x80 | hash;
+                }
+        };
+
+        static_assert(sizeof(meta) == 1, "expected meta to be 1 byte");
         
         // lower 2 bits
         //  x0 --> unoccupied
         //  x1 --> occupied
         //  1x --> ever occupied
-        uint8_t * meta_vec_;
+        meta * meta_vec_;
         T * data_vec_;
 
         // XXX: don't malloc
         hash_set_mem(size_t cap)
                 : capacity_{cap},
-                  meta_vec_{(uint8_t *)malloc(capacity_)},
+                  meta_vec_{(meta *)malloc(capacity_)},
                   data_vec_{(T *)malloc(capacity_ * sizeof(T))}
         {
                 memset(meta_vec_, 0, capacity_);
@@ -70,7 +130,7 @@ struct hash_set_mem
         ~hash_set_mem()
         {
                 for (size_t i = 0; i < capacity_; ++i)
-                        if (meta_vec_[i] & 0x1)
+                        if (meta_vec_[i].is_occupied())
                                 data_vec_[i].~T();
                 free(meta_vec_);
                 free(data_vec_);
@@ -99,13 +159,15 @@ void swap(hash_set_mem<T> & lhs, hash_set_mem<T> & rhs)
 template<typename T>
 class hash_set : hash_set_mem<T>
 {
-public:
+private:
         using base_t = hash_set_mem<T>;
+
+        using meta = typename base_t::meta;
+        
 
         size_t size_;
         size_t tombstones_;
 
-private:
         size_t sanitize_capacity(size_t cap)
         {
                 if (cap < 16) {
@@ -139,7 +201,7 @@ public:
         // xxx: make this iterator smaller? currently 32 bytes...
         template <bool is_const> 
         class iterator_impl {
-                using meta_ptr_t = typename std::conditional<is_const, const uint8_t *, uint8_t *>::type;
+                using meta_ptr_t = typename std::conditional<is_const, const meta *, meta *>::type;
         public:
                 using iterator_category = std::bidirectional_iterator_tag;
                 using value_type = typename std::conditional<is_const, const T, T>::type;
@@ -175,7 +237,7 @@ public:
                         for (;;) {
                                 ++offset;
 
-                                if (offset == capacity || meta_start[offset] & 0x1) {
+                                if (offset == capacity || meta_start[offset].is_occupied()) {
                                         break;
                                 }
                         }
@@ -188,7 +250,7 @@ public:
 
                         do {
                                 --offset;
-                                if (meta_start[offset] & 0x1) {
+                                if (meta_start[offset].is_occupied()) {
                                         return *this;
                                 }
                         } while (offset != 0);
@@ -223,7 +285,7 @@ private:
                 assert(size_ > 0);
 
                 for (size_t i = 0; i < this->capacity_; ++i) {
-                        if (this->meta_vec_[i] & 0x1) {
+                        if (this->meta_vec_[i].is_occupied()) {
                                 return i;
                         }
                 }
@@ -275,22 +337,20 @@ public:
         size_t __find(const T& val, bool & found) const
         {
                 const size_t hash = do_hash(val);
-                const size_t start = hash % this->capacity_;
+                const size_t start = (hash >> 7) % this->capacity_;
                 size_t i = start;
 
                 found = false;
 
                 do {
-                        uint8_t meta = this->meta_vec_[i];
+                        meta m = this->meta_vec_[i];
                         
                         // linear probing: we found a never-occupied, so we done
-                        if (!(meta & 0x2)) {
+                        if (m.is_never_occupied()) {
                                 break;
                         }
 
-                        // is this slot currently occupied and do the lower bits of the hash and
-                        // tht occupied bits. 0xfd == b11111101
-                        if ((meta & 0xfd) == (((hash & 0x3f) << 2) | 1)) {
+                        if (m.is_occupied() && m.get_hash() == (hash & 0x7f)) {
                                 T & v= this->data_vec_[i];
                                 if (val == v) {
                                         found = true;
@@ -327,7 +387,7 @@ public:
                 if (found) {
                         assert(size_ > 0);
                         
-                        this->meta_vec_[idx] = 0x2;
+                        this->meta_vec_[idx].make_tombstoned();
                         this->data_vec_[idx].~T();
                         --size_;
 
@@ -350,29 +410,32 @@ private:
                         hash_set bigger{__size_load() > 0.4 ? this->capacity_ * 2 : this->capacity_};
 
                         for (iterator i = begin(); i != end(); ++i) {
-                                // xxx: this insert() makes us recompute the hash, which isn't great
                                 bigger.insert(std::move(this->data_vec_[i.offset]));
-                                this->meta_vec_[i.offset] &= ~0x1;
+                                this->meta_vec_[i.offset].make_tombstoned();
                         }
 
                         swap(bigger);
                 }
 
                 const size_t hash = do_hash(val);
-                const size_t start = hash % this->capacity_;
+                const size_t start = (hash >> 7) % this->capacity_;
 
                 size_t i = start;
                 
                 do {
-                        uint8_t meta = this->meta_vec_[i];
+                        meta & m = this->meta_vec_[i];
 
-                        if (!(meta & 0x1)) {
-                                this->meta_vec_[i] = 0x3 | ((hash & 0x3f) << 2);
+                        if (m.is_insertable()) {
 
                                 // this slot has never been tombstoned before, so we got a new ts
-                                if (!(meta & 0x2))
+                                // once we eventaully erase things. We morbidly consider live values
+                                // as tombstones so that the tombstones_ count basically counts all
+                                // slots that an insert might have to consider, which is what we want
+                                // to know in load factor
+                                if (m.is_never_occupied())
                                         ++tombstones_;
 
+                                this->meta_vec_[i].make_occupied(hash & 0x7f);
                                 new (&this->data_vec_[i]) T{std::forward<U>(val)};
                                 ++size_;
                                 return std::make_pair(iterator_at(i), true);
@@ -436,6 +499,19 @@ public:
                 base_t::swap(rhs);
                 std::swap(size_, rhs.size_);
                 std::swap(tombstones_, rhs.tombstones_);
+        }
+
+        friend std::ostream& operator<<(std::ostream& os, const hash_set& set)
+        {
+                for (size_t i = 0; i < set.capacity(); ++i) {
+                        os << std::hex << std::setfill('0') << std::setw(2)
+                           << int(set.meta_vec_[i].m_);
+
+                        if (i != set.capacity() - 1) {
+                                os << " ";
+                        }
+                }
+                return os;
         }
 };
 
