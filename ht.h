@@ -20,9 +20,6 @@
 //   so iterators don't have to hold so much crap. They should just be able to store pointer + offset,
 //   maybe even just a pointer with a shift stuffed in the upper bits.
 //
-// * implement lookup with _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_set1_epi8(hash_byte), meta_bytes))
-//   that give you back a 16-bit bitmap which you can then scan with __builtin_ffs or whatever
-//
 // * seed the 57 bits of the hash with aslr >> 12
 //
 // * max load factor == 7/8
@@ -141,6 +138,12 @@ public:
         {
                 return reinterpret_cast<T*>(static_cast<uint8_t *>(mem_)
                                             + data_offset());
+        }
+
+        // only use to use aslr
+        const void * __get_mem() const
+        {
+                return mem_;
         }
 
         const meta * get_meta() const
@@ -383,7 +386,8 @@ public:
         size_t __find(const T& val, bool & found) const
         {
                 const size_t hash = do_hash(val);
-                const size_t start = ((hash >> 7) % this->capacity_) & ~static_cast<size_t>(0xff); // need 16 byte allignment for _mm_load_si128
+                // need 16 byte allignment for _mm_load_si128
+                const size_t start = (index_portion(hash) % this->capacity_) & ~size_t{0xf};
                 size_t i = start;
                 const meta * mvec = this->get_meta();
 
@@ -392,7 +396,7 @@ public:
                 do {
                         const __m128i * mem = reinterpret_cast<const __m128i *>(mvec + i);
                         const __m128i group = _mm_load_si128(mem);
-                        const __m128i search = _mm_set1_epi8(0x80 | (hash & 0x7f));
+                        const __m128i search = _mm_set1_epi8(0x80 | meta_portion(hash));
 
                         int bitmap = _mm_movemask_epi8(_mm_cmpeq_epi8(search, group));
 
@@ -478,7 +482,8 @@ private:
                 }
 
                 const size_t hash = do_hash(val);
-                const size_t start = ((hash >> 7) % this->capacity_) & ~size_t{0xff}; // need 16 byte allignment for _mm_load_si128
+                // need 16 byte allignment for _mm_load_si128
+                const size_t start = (index_portion(hash) % this->capacity_) & ~size_t{0xf};
 
                 size_t i = start;
                 meta * mvec = this->get_meta();
@@ -503,7 +508,7 @@ private:
                                 if (m.is_never_occupied())
                                         ++tombstones_;
 
-                                mvec[idx].make_occupied(hash & 0x7f);
+                                mvec[idx].make_occupied(meta_portion(hash));
                                 new (this->get_data() + idx) T{std::forward<U>(val)};
                                 ++size_;
                                 return std::make_pair(iterator_at(idx), true);
@@ -545,10 +550,24 @@ public:
         }
 
 private:
+        size_t index_portion(size_t hash) const
+        {
+                return hash >> 7;
+        }
+
+        uint8_t meta_portion(size_t hash) const
+        {
+                return hash & 0x7f;
+        }
+        
         // XXX: do better
         size_t do_hash(const T& val) const
         {
-                return std::hash<T>{}(val);
+                // seed the hash with ASLR and some random bits
+                return std::hash<T>{}(val) ^ (reinterpret_cast<size_t>(this->__get_mem()) >> 12)
+                                             ^ 0xf58e33ad9e13e5c1;
+                // last part from https://www.random.org/cgi-bin/randbyte?nbytes=8&format=h
+                // (you won't get the same result, read the url...)
         }
         
         double __size_load() const
