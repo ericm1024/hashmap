@@ -29,8 +29,6 @@
 //
 // * robin hood hashing == bad bc too many instructions
 //
-// * use only a single memory allocation
-//
 // * use C++ allocators
 
 template<typename T>
@@ -48,6 +46,8 @@ struct hash_set_mem
         //     bits 6:0 are low 7 bits of hash
         struct meta {
                 uint8_t m_;
+
+                meta(uint8_t m) : m_{m} {}
 
                 bool is_sentinal() const
                 {
@@ -321,10 +321,18 @@ private:
         size_t __find_first_occupied() const
         {
                 assert(size_ > 0);
+
                 const meta * mvec = this->get_meta();
-                for (size_t i = 0; i < this->capacity_; ++i) {
-                        if (mvec[i].is_occupied()) {
-                                return i;
+                __m128i mask = _mm_set1_epi8(0x80);
+                for (size_t i = 0; i < this->capacity(); i += 16) {
+                        const __m128i * mem = reinterpret_cast<const __m128i *>(mvec + i);
+
+                        __m128i group = _mm_load_si128(mem);
+                        __m128i masked = _mm_and_si128(group, mask);
+                        
+                        int bitmap = _mm_movemask_epi8(_mm_cmpeq_epi8(mask, masked));
+                        if (bitmap != 0) {
+                                return i + (__builtin_ffs(bitmap) - 1);
                         }
                 }
 
@@ -375,34 +383,43 @@ public:
         size_t __find(const T& val, bool & found) const
         {
                 const size_t hash = do_hash(val);
-                const size_t start = (hash >> 7) % this->capacity_;
+                const size_t start = ((hash >> 7) % this->capacity_) & ~static_cast<size_t>(0xff); // need 16 byte allignment for _mm_load_si128
                 size_t i = start;
                 const meta * mvec = this->get_meta();
 
                 found = false;
 
                 do {
-                        const meta m = mvec[i];
-                        
-                        // linear probing: we found a never-occupied, so we done
-                        if (m.is_never_occupied()) {
-                                break;
-                        }
+                        const __m128i * mem = reinterpret_cast<const __m128i *>(mvec + i);
+                        const __m128i group = _mm_load_si128(mem);
+                        const __m128i search = _mm_set1_epi8(0x80 | (hash & 0x7f));
 
-                        if (m.is_occupied() && m.get_hash() == (hash & 0x7f)) {
-                                const T & v= this->get_data()[i];
+                        int bitmap = _mm_movemask_epi8(_mm_cmpeq_epi8(search, group));
+
+                        while (bitmap != 0) {
+                                int bit = __builtin_ffs(bitmap) - 1;
+                                size_t idx = i + bit;
+                                const T & v= this->get_data()[idx];
                                 if (val == v) {
                                         found = true;
-                                        break;
+                                        return idx;
                                 }
+                                bitmap ^= (1 << bit); // builtin for this?
                         }
 
-                        i = (i + 1) % this->capacity_;
+                        // if anything in this group was ever zero, we can stop
+                        bitmap = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_set1_epi8(0x00), group));
+                        if (bitmap) {
+                                return 0;
+                        }
+
+                        i = (i + 16) % this->capacity_;
 
                 } while (i != start); // stop when we've looped around the whole table. should be
                                       // rare
 
-                return i;
+                assert(!"corrupted table"); // load factor prevents us from ever looping all the
+                                            // way around
         }
         
         iterator find(const T& val)
@@ -461,31 +478,38 @@ private:
                 }
 
                 const size_t hash = do_hash(val);
-                const size_t start = (hash >> 7) % this->capacity_;
+                const size_t start = ((hash >> 7) % this->capacity_) & ~size_t{0xff}; // need 16 byte allignment for _mm_load_si128
 
                 size_t i = start;
                 meta * mvec = this->get_meta();
                 
                 do {
-                        meta & m = mvec[i];
+                        const __m128i * mem = reinterpret_cast<const __m128i *>(mvec + i);
+                        const __m128i group = _mm_load_si128(mem);
+                        const __m128i masked = _mm_and_si128(group, _mm_set1_epi8(0x80));
 
-                        if (m.is_insertable()) {
+                        int bitmap = _mm_movemask_epi8(_mm_cmpeq_epi8(masked, _mm_set1_epi8(0x00)));
+                        if (bitmap != 0) {
+                                int bit = __builtin_ffs(bitmap) - 1;
+                                size_t idx = i + bit;
+
+                                meta m{static_cast<uint8_t>(_mm_extract_epi8(group, bit))};
 
                                 // this slot has never been tombstoned before, so we got a new ts
                                 // once we eventaully erase things. We morbidly consider live values
                                 // as tombstones so that the tombstones_ count basically counts all
-                                // slots that an insert might have to consider, which is what we want
-                                // to know in load factor
+                                // slots that an insert might have to consider, which is what we
+                                // want to know in load factor
                                 if (m.is_never_occupied())
                                         ++tombstones_;
 
-                                mvec[i].make_occupied(hash & 0x7f);
-                                new (this->get_data() + i) T{std::forward<U>(val)};
+                                mvec[idx].make_occupied(hash & 0x7f);
+                                new (this->get_data() + idx) T{std::forward<U>(val)};
                                 ++size_;
-                                return std::make_pair(iterator_at(i), true);
+                                return std::make_pair(iterator_at(idx), true);
                         }
 
-                        i = (i + 1) % this->capacity_;
+                        i = (i + 16) % this->capacity_;
                 } while (i != start);
 
                 // we never get here, we always find a slot
