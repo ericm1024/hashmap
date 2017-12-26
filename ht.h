@@ -20,8 +20,6 @@
 //   so iterators don't have to hold so much crap. They should just be able to store pointer + offset,
 //   maybe even just a pointer with a shift stuffed in the upper bits.
 //
-// * seed the 57 bits of the hash with aslr >> 12
-//
 // * max load factor == 7/8
 //
 // * robin hood hashing == bad bc too many instructions
@@ -341,6 +339,7 @@ private:
 
                 // we walked the whole damn table, but found nothing, even though size_ != 0. Bad.
                 assert(!"corrupted table");
+                __builtin_unreachable();
         }
 
         iterator iterator_at(size_t i)
@@ -424,6 +423,7 @@ public:
 
                 assert(!"corrupted table"); // load factor prevents us from ever looping all the
                                             // way around
+                __builtin_unreachable();
         }
         
         iterator find(const T& val)
@@ -485,7 +485,7 @@ private:
                 // need 16 byte allignment for _mm_load_si128
                 const size_t start = (index_portion(hash) % this->capacity_) & ~size_t{0xf};
 
-                size_t i = start;
+                se_t i = start;
                 meta * mvec = this->get_meta();
                 
                 do {
@@ -519,6 +519,7 @@ private:
 
                 // we never get here, we always find a slot
                 assert(!"corrupted table");
+                __builtin_unreachable();
         }
 
 public:
